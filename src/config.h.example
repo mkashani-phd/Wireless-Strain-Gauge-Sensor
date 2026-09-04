@@ -1,0 +1,33 @@
+// ---------------------------------------------------------------------------
+// config.h.example  -  copy to config.h, fill in your WiFi, then flash.
+//   cp src/config.h.example src/config.h
+// ---------------------------------------------------------------------------
+#pragma once
+
+// ---- WiFi -----------------------------------------------------------------
+#define WIFI_SSID        "YOUR_SSID"
+#define WIFI_PASS        "YOUR_PASSWORD"
+#define HOSTNAME         "loadcell"      // reachable as http://loadcell.local
+
+// ---- Network ports --------------------------------------------------------
+#define HTTP_PORT        80              // web GUI
+#define WS_PORT          81              // WebSocket (GUI <-> board)
+#define RAW_TCP_PORT     3333            // plain-TCP CSV stream for scripts
+
+// ---- Battery monitor ------------------------------------------------------
+// This board has a MAX17048 LiPo fuel gauge on the I2C bus (addr 0x36),
+// not a resistor divider on an ADC pin.
+
+// ---- Load cell defaults ---------------------------------------------------
+#define DEFAULT_UNITS    "g"
+#define DEFAULT_SCALE    1000.0f         // ADC counts per 1 unit (calibrate!)
+#define DEFAULT_GAIN_IDX 7               // 7 = x128
+#define DEFAULT_SPS_IDX  3               // 3 = 80 SPS  (0=10,1=20,2=40,3=80,7=320)
+#define DEFAULT_LDO_IDX  5               // 5 = 3.0 V   (must be < 3.3 V VIN)
+#define DEFAULT_AVG      4               // moving-average window, 1..64
+
+// ---- Streaming ------------------------------------------------------------
+#define WS_BATCH_MS      50              // how often to flush samples to clients
+#define STATUS_MS        1000            // status/battery push period
+#define TFT_MS           200             // screen refresh period
+#define MAX_RAW_CLIENTS  4
