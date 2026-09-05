@@ -5,9 +5,14 @@
 #pragma once
 
 // ---- WiFi -----------------------------------------------------------------
+// Used only as the seed default the very first time the board boots (or after
+// a saved-network failure, until you set new ones via the setup hotspot).
+// Once you save credentials through http://192.168.4.1/ (the "LoadCell-Setup"
+// AP that appears if the board can't join a network), those are what's
+// actually used - re-editing this file won't override a saved network.
 #define WIFI_SSID        "YOUR_SSID"
 #define WIFI_PASS        "YOUR_PASSWORD"
-#define HOSTNAME         "loadcell"      // reachable as http://loadcell.local
+#define HOSTNAME         "Contact_Pressure"   // reachable as http://Contact_Pressure.local
 
 // ---- Network ports --------------------------------------------------------
 #define HTTP_PORT        80              // web GUI

@@ -25,10 +25,15 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <Adafruit_MAX1704X.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 
 #include "config.h"
 #include "nau7802.h"
 #include "webpage.h"
+#include "portal.h"
 
 // ---------------------------------------------------------------------------
 // globals
@@ -40,6 +45,14 @@ WebServer       http(HTTP_PORT);
 WebSocketsServer ws(WS_PORT);
 WiFiServer      rawServer(RAW_TCP_PORT);
 WiFiClient      rawClients[MAX_RAW_CLIENTS];
+
+// --- WiFi provisioning: if the saved network can't be joined, fall back to
+// a setup hotspot + captive portal instead of just running with no network.
+Preferences prefs;
+DNSServer   dnsServer;
+static const char *AP_SSID = "ContactPressure-Setup";
+enum WifiMode { WIFI_MODE_CONNECTED, WIFI_MODE_PROVISION };
+WifiMode wifiMode = WIFI_MODE_CONNECTED;
 
 // --- measurement state, per NAU7802 channel (0 = CH1, 1 = CH2)
 static const uint8_t NCHAN = 2;
@@ -72,11 +85,44 @@ static const uint8_t BATCH_MAX = 32;
 int32_t  batchRaw[NCHAN][BATCH_MAX];
 uint8_t  batchN[NCHAN] = {0, 0};
 
-uint32_t tLastBatch = 0, tLastStatus = 0, tLastTft = 0, tLastBtn = 0;
+uint32_t tLastBatch = 0, tLastStatus = 0, tLastTft = 0;
 
 // --- battery
 float    vbat = 0;
 int      battPct = 0;
+
+// --- display state: one channel shown at a time, screen can be blanked
+uint8_t  dispChan = 0;      // which channel tftUpdate() shows
+bool     screenOn  = true;  // false while blanked by a D1 long-press
+
+// ---------------------------------------------------------------------------
+// button debouncing
+//
+// A mechanical button doesn't cleanly go from open to closed: the contacts
+// physically bounce for a few ms, so a naive digitalRead() edge check can see
+// several spurious transitions on a single press. This tracks how long the
+// raw reading has been stable and only commits it as the button's real level
+// once it's held past MS - a transition shorter than that is bounce noise
+// and gets ignored. Call update() every loop() iteration (not gated to some
+// polling interval) so the debounce timing itself stays accurate. Edge
+// detection (rising/falling) is done by the caller comparing successive
+// update() results, since D1 needs both edges to tell a short tap from a
+// long hold.
+// ---------------------------------------------------------------------------
+struct Debounce {
+  static const uint32_t MS = 30;
+  bool     raw = false;      // last raw sample seen
+  bool     stable = false;   // debounced, committed level
+  uint32_t tChange = 0;      // when `raw` last changed
+
+  bool update(bool level) {
+    uint32_t now = millis();
+    if (level != raw) { raw = level; tChange = now; }
+    if (now - tChange >= MS) stable = raw;
+    return stable;
+  }
+};
+Debounce db0, db1, db2;
 
 // ---------------------------------------------------------------------------
 // battery: MAX17048 fuel gauge over I2C
@@ -129,73 +175,155 @@ String pad(const String &s, int n) {
   return r;
 }
 
+// left-edge legend column (button id + function) and a right-edge column
+// marking the physical hard-reset button, bracketing the CH1/CH2 reading
+// and status area in the middle.
+static const int LEGEND_W    = 34;
+static const int RIGHT_COL_W = 34;
+static const int MID_RIGHT   = 240 - RIGHT_COL_W;   // right edge of the middle area
+
+// Renders text into an off-screen 1-bit buffer, then stamps it onto the
+// display rotated 90 clockwise (so it reads top-to-bottom). Simpler and
+// safer than juggling the display's global setRotation() mid-draw, since it
+// can't disturb anything else's orientation if the math here is off.
+void drawVerticalLabel(int x, int y, const char *text, uint16_t color) {
+  GFXcanvas1 canvas(72, 8);
+  canvas.setTextSize(1);
+  canvas.setTextColor(1);
+  canvas.setCursor(0, 0);
+  canvas.print(text);
+
+  int w = canvas.width(), h = canvas.height();
+  for (int sy = 0; sy < h; sy++) {
+    for (int sx = 0; sx < w; sx++) {
+      if (canvas.getPixel(sx, sy)) {
+        tft.drawPixel(x + (h - 1 - sy), y + sx, color);
+      }
+    }
+  }
+}
+
 void tftStatic() {
   tft.fillScreen(COL_BG);
-  tft.drawFastHLine(0, 20, 240, COL_LABEL);
-  tft.drawFastHLine(0, 92, 240, COL_LABEL);
+  tft.drawFastVLine(LEGEND_W, 0, 135, COL_LABEL);
+  tft.drawFastVLine(MID_RIGHT, 0, 135, COL_LABEL);
+  tft.drawFastHLine(LEGEND_W, 10, MID_RIGHT - LEGEND_W, COL_LABEL);
+  tft.drawFastHLine(LEGEND_W, 90, MID_RIGHT - LEGEND_W, COL_LABEL);
+
+  // button legend, one entry per third of the screen height, D0 top -> D2 bottom
+  static const char    *ID[3]    = {"D0", "D1", "D2"};
+  static const char    *FUNC[3]  = {"TARE", "CHAN", "POWER"};
+  static const uint16_t COLOR[3] = {ST77XX_BLUE, COL_VALUE, COL_BAD};
   tft.setTextSize(1);
-  tft.setTextColor(COL_LABEL, COL_BG);
-  tft.setCursor(0, 26);  tft.print("CH1");
-  tft.setCursor(0, 58);  tft.print("CH2");
-  tft.setCursor(0, 100); tft.print("BAT");
+  for (uint8_t i = 0; i < 3; i++) {
+    int y0 = i * 45;
+    tft.setTextColor(COLOR[i], COL_BG);
+    tft.setCursor(3, y0 + 16); tft.print(ID[i]);
+    tft.setCursor(3, y0 + 28); tft.print(FUNC[i]);
+    if (i) tft.drawFastHLine(0, y0, LEGEND_W, COL_LABEL);
+  }
+
+  // right column: where the physical hard-reset button is, written
+  // vertically (rotated 90) since the column itself is only 34px wide
+  drawVerticalLabel(MID_RIGHT + 13, 32, "HARD REBOOT", COL_WARN);
 }
 
 void tftUpdate() {
+  if (!screenOn || wifiMode == WIFI_MODE_PROVISION) return;
   char buf[40];
 
-  // --- top bar: IP + RSSI
+  // --- top row: IP address, then voltage, then the battery bar
   tft.setTextSize(1);
   tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.setCursor(0, 4);
-  if (WiFi.status() == WL_CONNECTED) tft.print(pad(WiFi.localIP().toString(), 17));
-  else                               tft.print(pad("connecting...", 17));
-  tft.setTextColor(COL_LABEL, COL_BG);
-  tft.setCursor(160, 4);
-  snprintf(buf, sizeof(buf), "%4ddBm", (int)WiFi.RSSI());
-  tft.print(buf);
+  tft.setCursor(LEGEND_W + 2, 1);
+  if (WiFi.status() == WL_CONNECTED) tft.print(pad("IP: " + WiFi.localIP().toString(), 16));
+  else                               tft.print(pad("connecting...", 16));
 
-  // --- one reading line per channel
-  for (uint8_t ch = 0; ch < NCHAN; ch++) {
-    tft.setTextSize(2);
-    tft.setTextColor(adcOk ? COL_VALUE : COL_BAD, COL_BG);
-    tft.setCursor(36, 24 + ch * 32);
-    if (adcOk) {
-      float v = lastUnits[ch];
-      if (fabsf(v) < 1000)        snprintf(buf, sizeof(buf), "%9.2f", v);
-      else if (fabsf(v) < 100000) snprintf(buf, sizeof(buf), "%9.0f", v);
-      else                        snprintf(buf, sizeof(buf), "%9.1e", v);
-    } else {
-      snprintf(buf, sizeof(buf), "   NO ADC");
-    }
-    tft.print(buf);
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(36, 42 + ch * 32);
-    snprintf(buf, sizeof(buf), "%-4s raw %+9ld", unitLabel[ch], (long)lastRaw[ch]);
-    tft.print(pad(String(buf), 26));
-  }
-
-  // --- battery bar
-  int w = (int)(100.0f * battPct / 100.0f);
+  // battery: voltage text right next to the bar, both anchored to the
+  // right edge of the middle area (not the screen - the reboot column owns that)
   uint16_t bc = battPct > 40 ? COL_OK : (battPct > 15 ? COL_WARN : COL_BAD);
-  tft.drawRect(30, 98, 102, 12, COL_LABEL);
-  tft.fillRect(31, 99, w, 10, bc);
-  tft.fillRect(31 + w, 99, 100 - w, 10, COL_BG);
+  int bw = 20, bh = 8, bx = MID_RIGHT - bw - 2, by = 1;
+  int fw = constrain(battPct, 0, 100) * (bw - 2) / 100;
+  tft.drawRect(bx, by, bw, bh, COL_LABEL);
+  tft.fillRect(bx + 1, by + 1, fw, bh - 2, bc);
+  tft.fillRect(bx + 1 + fw, by + 1, (bw - 2) - fw, bh - 2, COL_BG);
+
   tft.setTextColor(COL_VALUE, COL_BG);
-  tft.setCursor(140, 100);
-  snprintf(buf, sizeof(buf), "%3d%% %4.2fV", battPct, vbat);
+  tft.setCursor(bx - 34, by);
+  snprintf(buf, sizeof(buf), "%4.2fV", vbat);
   tft.print(buf);
 
-  // --- bottom status
+  // --- one big reading for whichever channel D1 has selected
+  tft.setTextSize(2);
   tft.setTextColor(COL_LABEL, COL_BG);
-  tft.setCursor(0, 122);
-  snprintf(buf, sizeof(buf), "x%-3u %3uSPS(%4.1f) cl:%u",
+  tft.setCursor(LEGEND_W + 2, 14);
+  snprintf(buf, sizeof(buf), "CH%u", dispChan + 1);
+  tft.print(pad(String(buf), 4));
+
+  // Fixed-width field, sized to always fit at this font size (wrap is off,
+  // so anything wider would just clip instead of spilling onto the next
+  // line and leaving unerased leftovers there).
+  tft.setTextSize(4);
+  tft.setTextColor(adcOk ? COL_VALUE : COL_BAD, COL_BG);
+  tft.setCursor(LEGEND_W + 2, 34);
+  if (adcOk) {
+    float v = lastUnits[dispChan];
+    if (fabsf(v) < 1000) snprintf(buf, sizeof(buf), "%6.1f", v);
+    else                 snprintf(buf, sizeof(buf), "%6.0f", v);
+  } else {
+    snprintf(buf, sizeof(buf), "   ERR");
+  }
+  tft.print(buf);
+
+  tft.setTextSize(2);
+  tft.setTextColor(COL_LABEL, COL_BG);
+  tft.setCursor(LEGEND_W + 2, 70);
+  tft.print(pad(String(unitLabel[dispChan]), 6));
+
+  // --- bottom status row: gain, rate, ws clients
+  float spsDisp = (isnan(actualSps) || isinf(actualSps)) ? 0.0f : constrain(actualSps, 0.0f, 999.9f);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_LABEL, COL_BG);
+  tft.setCursor(LEGEND_W + 2, 124);
+  snprintf(buf, sizeof(buf), "x%-3u %3uSPS(%5.1f) cl:%u",
            NAU_GAIN_TABLE[adc.getGainIdx()],
            NAU_SPS_TABLE[adc.getSpsIdx()],
-           actualSps,
+           spsDisp,
            ws.connectedClients());
-  tft.print(pad(String(buf), 30));
+  tft.print(pad(String(buf), 28));
+}
+
+// Dedicated screen shown while in the WiFi-setup hotspot: how to join it and
+// where to browse if the OS doesn't pop the sign-in page up automatically.
+void tftProvisionScreen() {
+  tft.fillScreen(COL_BG);
+  tft.setTextSize(2);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.setCursor(4, 4);
+  tft.print("Contact Pressure");
+
+  tft.setTextSize(1);
+  tft.setTextColor(COL_LABEL, COL_BG);
+  tft.setCursor(4, 28);
+  tft.print("Can't join WiFi. Connect to:");
+
+  tft.setTextColor(COL_WARN, COL_BG);
+  tft.setCursor(4, 42);
+  tft.print(AP_SSID);
+
+  tft.setTextColor(COL_LABEL, COL_BG);
+  tft.setCursor(4, 62);
+  tft.print("Then open in a browser:");
+
+  tft.setTextColor(COL_VALUE, COL_BG);
+  tft.setCursor(4, 76);
+  tft.print("http://" + WiFi.softAPIP().toString());
+
+  tft.setTextColor(COL_LABEL, COL_BG);
+  tft.setCursor(4, 96);
+  tft.print("(skip that if a setup page");
+  tft.setCursor(4, 106);
+  tft.print(" already popped up)");
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +445,35 @@ void reconfigure() {
   sendLog(ok ? "AFE calibration ok (both channels)" : "AFE calibration FAILED");
 }
 
+// There's no physical battery-disconnect switch on this board, so "off" is
+// software: cut the shared TFT+STEMMA-QT power rail (kills the display and
+// the NAU7802 both), then drop the ESP32-S2 itself into deep sleep. Power
+// draw in deep sleep is in the microamp range, as close to "off" as we get.
+// The D2 button is configured as an RTC wake source, so pressing it again
+// triggers a full reset that re-runs setup() from scratch, just like a
+// power-on boot.
+void powerOff() {
+  sendLog("powering off - press D2 to wake");
+  delay(50);   // let the log/serial print flush before everything dies
+
+  digitalWrite(TFT_BACKLITE, LOW);
+  digitalWrite(TFT_I2C_POWER, LOW);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // ext0 wakeup is level-triggered: if D2 is still physically held down when
+  // we arm it, the wake level (HIGH) is already satisfied and the chip wakes
+  // again immediately, looking like an instant reboot instead of powering
+  // off. Wait for release first.
+  while (digitalRead(2)) delay(5);
+  delay(20);
+
+  rtc_gpio_pulldown_en(GPIO_NUM_2);
+  rtc_gpio_pullup_dis(GPIO_NUM_2);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, 1);   // wake on D2 going HIGH
+  esp_deep_sleep_start();
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket command handling
 // ---------------------------------------------------------------------------
@@ -396,6 +553,14 @@ void rawSend(uint32_t ms, uint8_t ch, int32_t raw, float units) {
 void setup() {
   Serial.begin(115200);
 
+  // If we're coming back from powerOff()'s deep sleep, GPIO2 was handed to
+  // the RTC controller for ext0 wake and won't behave as a normal digital
+  // pin again until that claim is released.
+  rtc_gpio_deinit(GPIO_NUM_2);
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  Serial.printf("wake cause: %d (%s)\n", (int)wakeCause,
+                wakeCause == ESP_SLEEP_WAKEUP_EXT0 ? "D2 button" : "power-on/reset");
+
   // power rails for the TFT and the STEMMA QT port
   pinMode(TFT_I2C_POWER, OUTPUT);
   digitalWrite(TFT_I2C_POWER, HIGH);
@@ -405,6 +570,16 @@ void setup() {
 
   tft.init(135, 240);
   tft.setRotation(3);
+  tft.setTextWrap(false);   // an oversized value should clip, not wrap onto
+                            // another row and leave unerased leftovers there
+
+  tft.fillScreen(COL_BG);
+  tft.setTextSize(3);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.setCursor(30, 50);
+  tft.print("Hello!");
+  delay(900);
+
   tftStatic();
   tft.setTextSize(1);
   tft.setTextColor(COL_VALUE, COL_BG);
@@ -440,24 +615,54 @@ void setup() {
     Serial.println("NAU7802 NOT FOUND - check the QT cable");
   }
 
-  // ---- WiFi
+  // ---- WiFi: try the saved network (Preferences, seeded from config.h on
+  // first boot); if that fails, open a setup hotspot instead of just running
+  // with no network at all.
+  prefs.begin("wifi", false);
+  String savedSsid = prefs.getString("ssid", WIFI_SSID);
+  String savedPass = prefs.getString("pass", WIFI_PASS);
+
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.setSleep(false);                 // much lower latency for streaming
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(savedSsid.c_str(), savedPass.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
     delay(250);
     Serial.print('.');
   }
   Serial.println();
+
   if (WiFi.status() == WL_CONNECTED) {
+    wifiMode = WIFI_MODE_CONNECTED;
     Serial.print("IP: "); Serial.println(WiFi.localIP());
     if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", HTTP_PORT);
+  } else {
+    wifiMode = WIFI_MODE_PROVISION;
+    Serial.println("WiFi join failed - opening setup hotspot");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID);
+    dnsServer.start(53, "*", WiFi.softAPIP());   // answer every DNS lookup with
+                                                  // our own IP so most OSes pop
+                                                  // up a "sign in to network" page
+    Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+    tftProvisionScreen();
   }
 
   // ---- servers
-  http.on("/", []() { http.send_P(200, "text/html", INDEX_HTML); });
+  http.on("/", []() {
+    if (wifiMode == WIFI_MODE_PROVISION) http.send_P(200, "text/html", PORTAL_HTML);
+    else                                 http.send_P(200, "text/html", INDEX_HTML);
+  });
+  http.on("/save", HTTP_POST, []() {
+    String ssid = http.arg("ssid");
+    if (!ssid.length()) { http.send(400, "text/plain", "SSID required"); return; }
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", http.arg("pass"));
+    http.send(200, "text/html", "<h1>Saved. Restarting...</h1>");
+    delay(1000);
+    ESP.restart();
+  });
   http.on("/api/status", []() {
     JsonDocument d;
     d["ip"]   = WiFi.localIP().toString();
@@ -469,7 +674,17 @@ void setup() {
     String out; serializeJson(d, out);
     http.send(200, "application/json", out);
   });
-  http.onNotFound([]() { http.send(404, "text/plain", "not found"); });
+  http.onNotFound([]() {
+    if (wifiMode == WIFI_MODE_PROVISION) {
+      // Captive-portal catch-all: redirect any unknown path back to "/" so
+      // the OS's connectivity check gets a redirect instead of a 404, which
+      // is what makes most phones/laptops pop the sign-in page automatically.
+      http.sendHeader("Location", "/", true);
+      http.send(302, "text/plain", "");
+    } else {
+      http.send(404, "text/plain", "not found");
+    }
+  });
   http.begin();
 
   ws.begin();
@@ -514,6 +729,7 @@ void loop() {
   ws.loop();
   http.handleClient();
   rawAccept();
+  if (wifiMode == WIFI_MODE_PROVISION) dnsServer.processNextRequest();
 
   // ---- 3. flush a batch of samples to the GUI
   if (streaming && now - tLastBatch >= WS_BATCH_MS) {
@@ -562,14 +778,41 @@ void loop() {
   // ---- 5. screen
   if (now - tLastTft >= TFT_MS) { tLastTft = now; tftUpdate(); }
 
-  // ---- 6. buttons (D0 = tare, D1 = backlight, D2 = pause stream)
-  if (now - tLastBtn >= 120) {
-    tLastBtn = now;
-    static bool p0 = false, p1 = false, p2 = false, bl = true;
-    bool b0 = !digitalRead(0), b1 = digitalRead(1), b2 = digitalRead(2);
-    if (b0 && !p0) { doTare(0); doTare(1); }
-    if (b1 && !p1) { bl = !bl; digitalWrite(TFT_BACKLITE, bl); }
-    if (b2 && !p2) { streaming = !streaming; sendStatus(); }
-    p0 = b0; p1 = b1; p2 = b2;
+  // ---- 6. buttons: D0 = tare, D1 = tap:switch channel / hold 1s:screen off,
+  // D2 = power off/on (deep sleep). Debounced; while the screen is blanked,
+  // any button press just wakes it back up instead of doing its normal job.
+  {
+    static const uint32_t HOLD_MS = 1000;
+    static bool p0 = false, p1 = false, p2 = false;
+    static uint32_t d1PressStart = 0;
+    static bool d1LongFired = false;
+
+    bool s0 = db0.update(!digitalRead(0));
+    bool s1 = db1.update(digitalRead(1));
+    bool s2 = db2.update(digitalRead(2));
+    bool rising0 = s0 && !p0, rising1 = s1 && !p1;
+    bool falling1 = !s1 && p1, rising2 = s2 && !p2;
+
+    if (!screenOn) {
+      if (rising0 || rising1 || rising2) {
+        screenOn = true;
+        digitalWrite(TFT_BACKLITE, HIGH);
+        tftStatic();
+      }
+    } else {
+      if (rising0) { doTare(0); doTare(1); }
+
+      if (rising1) { d1PressStart = millis(); d1LongFired = false; }
+      if (s1 && !d1LongFired && millis() - d1PressStart >= HOLD_MS) {
+        d1LongFired = true;
+        screenOn = false;
+        digitalWrite(TFT_BACKLITE, LOW);
+        tft.fillScreen(COL_BG);
+      }
+      if (falling1 && !d1LongFired) { dispChan = 1 - dispChan; }   // short tap
+
+      if (rising2) powerOff();   // never returns; wakes on next D2 press
+    }
+    p0 = s0; p1 = s1; p2 = s2;
   }
 }

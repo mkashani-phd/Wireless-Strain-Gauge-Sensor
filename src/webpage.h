@@ -10,7 +10,7 @@ const char INDEX_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NAU7802 Load Cell</title>
+<title>Contact Pressure</title>
 <style>
 :root{
   --bg:#0e1116; --panel:#161b22; --line:#2a313c; --fg:#e6edf3;
@@ -66,7 +66,7 @@ td input{width:62px;padding:2px 5px;font-family:ui-monospace,monospace}
 <body>
 
 <header>
-  <h1>NAU7802 Load Cell</h1>
+  <h1>Contact Pressure</h1>
   <span class="chip"><span class="dot" id="dot"></span><span id="conn">offline</span></span>
   <span class="chip">IP <b id="ip">-</b></span>
   <span class="chip">RSSI <b id="rssi">-</b></span>
@@ -93,6 +93,14 @@ td input{width:62px;padding:2px 5px;font-family:ui-monospace,monospace}
           <option value="2000">2000 pts</option>
         </select>
       </div>
+      <div class="row">
+        <button id="bRec">Record</button>
+        <button id="bSave">Download CSV</button>
+        <span class="hint" id="recinfo"></span>
+      </div>
+      <p class="hint">One recording covers both channels together, timestamped
+      by this computer's clock, with battery voltage and the active settings
+      saved in the file header.</p>
     </div>
 
     <div class="card" style="margin-top:14px">
@@ -175,9 +183,6 @@ function chanColumnHTML(ch){
       <div class="row" style="margin-top:12px">
         <button class="pri" id="bTare${ch}">Tare (zero)</button>
         <button id="bClear${ch}">Clear chart</button>
-        <button id="bRec${ch}">Record CSV</button>
-        <button id="bSave${ch}">Download CSV</button>
-        <span class="hint" id="recinfo${ch}"></span>
       </div>
     </div>
     <div class="card" style="margin-top:14px">
@@ -217,11 +222,17 @@ for (let ch = 0; ch < NCHAN; ch++) document.getElementById("colCh"+ch).innerHTML
 
 // ---------------------------------------------------------------- state
 let ws, paused=false, keyOnly=false;
-let regcache = {};
+let regcache = {}, lastStatus = null;
 const chanState = [];
 for (let ch = 0; ch < NCHAN; ch++) chanState.push({
-  offset:0, kscale:1, unit:"g", data:[], maxPts:600, recording:false, recBuf:[]
+  offset:0, kscale:1, unit:"g", data:[], times:[], lastMs:null, maxPts:600
 });
+
+// one recording covers both channels, timestamped by this computer's clock
+let recording = false, recRows = [];
+let battV = 0, battPct = 0;
+const lastKnown = [{raw:0, units:0}, {raw:0, units:0}];
+
 const $ = id => document.getElementById(id);
 const log = m => { const d=$("log");
   d.innerHTML += new Date().toLocaleTimeString()+"  "+m+"<br>";
@@ -250,16 +261,35 @@ const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
 function onData(m){
   if (paused) return;
   const t0 = m.ms;
+  // Wall-clock time for board-ms 0, so every sample below (however its exact
+  // instant is interpolated within the batch) converts to a real timestamp.
+  const wallOffset = Date.now() - t0;
+
   m.ch.forEach((c, ch) => {
     const st = chanState[ch];
     st.offset = c.o; st.kscale = c.k;
-    for (let i = 0; i < c.v.length; i++){
+    // Spread this batch's samples evenly over the interval since the last
+    // batch so the x-axis reflects real elapsed time, not just point index.
+    const k = c.v.length;
+    const dt = (st.lastMs != null && k) ? (t0 - st.lastMs) : 0;
+    for (let i = 0; i < k; i++){
       const raw = c.v[i];
       const u = st.kscale ? (raw - st.offset) / st.kscale : 0;
+      const sampleMs = t0 - dt * (k - 1 - i) / k;
       st.data.push(u);
-      if (st.recording) st.recBuf.push([t0, raw, u.toFixed(5)]);
+      st.times.push(sampleMs);
+      lastKnown[ch] = { raw, units: u };
+      if (recording) {
+        recRows.push([
+          new Date(wallOffset + sampleMs).toISOString(),
+          lastKnown[0].raw, lastKnown[0].units.toFixed(5),
+          lastKnown[1].raw, lastKnown[1].units.toFixed(5),
+          battV.toFixed(3), battPct
+        ]);
+      }
     }
-    while (st.data.length > st.maxPts) st.data.shift();
+    if (k) st.lastMs = t0;
+    while (st.data.length > st.maxPts) { st.data.shift(); st.times.shift(); }
     if (c.v.length){
       const last = c.v[c.v.length-1];
       const lu = st.kscale ? (last - st.offset)/st.kscale : 0;
@@ -271,6 +301,8 @@ function onData(m){
 }
 
 function onStatus(s){
+  lastStatus = s;
+  battV = s.vbat; battPct = s.pct;
   $("ip").textContent   = s.ip;
   $("rssi").textContent = s.rssi + " dBm";
   $("sps").textContent  = s.sps_act.toFixed(1) + " / " + s.sps + " SPS";
@@ -357,14 +389,21 @@ function fit(){
 addEventListener("resize", fit);
 
 function draw(ch){
-  const st = chanState[ch], cv = st.cv, cx = st.cx, data = st.data;
+  const st = chanState[ch], cv = st.cv, cx = st.cx, data = st.data, times = st.times;
   const W = cv.clientWidth, H = cv.clientHeight;
+  const topPad = 6, botPad = 16;
   cx.clearRect(0,0,W,H);
   if (data.length < 2) return;
   let lo = Math.min(...data), hi = Math.max(...data);
   if (hi - lo < 1e-9) { hi += 1; lo -= 1; }
-  const pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
-  const y = v => H - 6 - (v - lo) / (hi - lo) * (H - 26);
+  const vpad = (hi - lo) * 0.12; lo -= vpad; hi += vpad;
+  const y = v => H - botPad - (v - lo) / (hi - lo) * (H - topPad - botPad);
+
+  // x-axis is real elapsed time (seconds ago), not sample index, so gaps or
+  // uneven per-channel sampling show up as they actually happened.
+  const tEnd = times[times.length - 1], tStart = times[0];
+  const span = Math.max(tEnd - tStart, 1);   // ms, avoid div-by-zero
+  const x = t => (t - tStart) / span * W;
 
   cx.strokeStyle = "#1d232c"; cx.lineWidth = 1;
   cx.fillStyle = "#6e7681"; cx.font = "10px ui-monospace,monospace";
@@ -373,12 +412,22 @@ function draw(ch){
     cx.beginPath(); cx.moveTo(0,yy); cx.lineTo(W,yy); cx.stroke();
     cx.fillText(v.toFixed(2), 3, yy - 3);
   }
+  // vertical gridlines labeled in seconds-ago
+  for (let i = 0; i <= 4; i++){
+    const t = tStart + span * i / 4, xx = Math.round(x(t)) + 0.5;
+    const secAgo = (tEnd - t) / 1000;
+    cx.beginPath(); cx.moveTo(xx, topPad); cx.lineTo(xx, H - botPad); cx.stroke();
+    const label = (secAgo < 0.05 ? "0" : "-" + secAgo.toFixed(1)) + "s";
+    const tw = cx.measureText(label).width;
+    cx.fillText(label, Math.min(Math.max(xx - tw/2, 0), W - tw), H - 4);
+  }
+
   cx.strokeStyle = "#2f81f7"; cx.lineWidth = 1.6; cx.beginPath();
-  data.forEach((v,i) => { const xx = i/(data.length-1)*W;
+  data.forEach((v,i) => { const xx = x(times[i]);
                           i ? cx.lineTo(xx, y(v)) : cx.moveTo(xx, y(v)); });
   cx.stroke();
   cx.fillStyle = "#6e7681";
-  cx.fillText(data.length + " pts   " + st.unit, W - 110, 12);
+  cx.fillText(data.length + " pts / " + (span/1000).toFixed(1) + "s   " + st.unit, W - 150, 12);
 }
 
 // ---------------------------------------------------------------- controls
@@ -390,28 +439,36 @@ for (let ch = 0; ch < NCHAN; ch++) {
   $("bO"+ch).onclick    = () => send({c:"offset", ch, v:parseInt($("oset"+ch).value)});
   $("bU"+ch).onclick    = () => send({c:"units", ch, v:$("uset"+ch).value.slice(0,7)});
   $("avg"+ch).onchange  = e => send({c:"avg", ch, v:+e.target.value});
-  $("bClear"+ch).onclick = () => { st.data = []; draw(ch); };
-  $("bRec"+ch).onclick = () => {
-    st.recording = !st.recording;
-    if (st.recording) st.recBuf = [];
-    $("bRec"+ch).textContent = st.recording ? "Stop recording" : "Record CSV";
-    $("bRec"+ch).classList.toggle("pri", st.recording);
-  };
-  $("bSave"+ch).onclick = () => {
-    if (!st.recBuf.length) { log("nothing recorded"); return; }
-    const csv = "ms,raw,"+st.unit+"\n" + st.recBuf.map(r => r.join(",")).join("\n");
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([csv], {type:"text/csv"}));
-    a.download = "loadcell_ch"+(ch+1)+"_" + Date.now() + ".csv";
-    a.click();
-  };
+  $("bClear"+ch).onclick = () => { st.data = []; st.times = []; st.lastMs = null; draw(ch); };
 }
-setInterval(() => {
-  for (let ch = 0; ch < NCHAN; ch++) {
-    const st = chanState[ch];
-    $("recinfo"+ch).textContent = st.recording ? st.recBuf.length+" rows" : "";
+
+$("bRec").onclick = () => {
+  recording = !recording;
+  if (recording) recRows = [];
+  $("bRec").textContent = recording ? "Stop recording" : "Record";
+  $("bRec").classList.toggle("pri", recording);
+};
+$("bSave").onclick = () => {
+  if (!recRows.length) { log("nothing recorded"); return; }
+  const lines = [];
+  lines.push("# Wireless Strain Gauge recording");
+  lines.push("# exported " + new Date().toISOString());
+  if (lastStatus) {
+    lines.push(`# gain x${lastStatus.gain}  sps ${lastStatus.sps} (actual ${lastStatus.sps_act.toFixed(1)})  ldo ${lastStatus.ldo}V`);
+    lastStatus.ch.forEach((c, ch) => {
+      lines.push(`# ch${ch+1}: offset=${c.offset} scale=${c.scale} units=${c.units} avg=${c.avg}`);
+    });
   }
-}, 500);
+  lines.push("#");
+  lines.push("timestamp,ch1_raw,ch1_units,ch2_raw,ch2_units,battery_v,battery_pct");
+  recRows.forEach(r => lines.push(r.join(",")));
+  const csv = lines.join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], {type:"text/csv"}));
+  a.download = "loadcell_" + Date.now() + ".csv";
+  a.click();
+};
+setInterval(() => { $("recinfo").textContent = recording ? recRows.length+" rows" : ""; }, 500);
 
 $("bAfe").onclick   = () => send({c:"afecal"});
 $("bRst").onclick   = () => send({c:"reset"});
