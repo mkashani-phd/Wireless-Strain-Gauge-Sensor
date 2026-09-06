@@ -186,10 +186,11 @@ static const int RIGHT_COL_W = 34;
 static const int MID_RIGHT   = 240 - RIGHT_COL_W;   // right edge of the middle area
 
 // Renders text into an off-screen 1-bit buffer, then stamps it onto the
-// display rotated 90 clockwise (so it reads top-to-bottom). Simpler and
-// safer than juggling the display's global setRotation() mid-draw, since it
-// can't disturb anything else's orientation if the math here is off.
-void drawVerticalLabel(int x, int y, const char *text, uint16_t color, uint8_t size = 1) {
+// display rotated 90 (cw=true, reads top-to-bottom) or 270/-90 (cw=false,
+// reads bottom-to-top). Simpler and safer than juggling the display's
+// global setRotation() mid-draw, since it can't disturb anything else's
+// orientation if the math here is off.
+void drawVerticalLabel(int x, int y, const char *text, uint16_t color, uint8_t size = 1, bool cw = true) {
   GFXcanvas1 canvas(strlen(text) * 6 * size, 8 * size);
   canvas.setTextSize(size);
   canvas.setTextColor(1);
@@ -200,7 +201,8 @@ void drawVerticalLabel(int x, int y, const char *text, uint16_t color, uint8_t s
   for (int sy = 0; sy < h; sy++) {
     for (int sx = 0; sx < w; sx++) {
       if (canvas.getPixel(sx, sy)) {
-        tft.drawPixel(x + (h - 1 - sy), y + sx, color);
+        if (cw) tft.drawPixel(x + (h - 1 - sy), y + sx, color);
+        else    tft.drawPixel(x + sy,           y + (w - 1 - sx), color);
       }
     }
   }
@@ -213,16 +215,14 @@ void tftStatic() {
   tft.drawFastHLine(LEGEND_W, 10, MID_RIGHT - LEGEND_W, COL_LABEL);
   tft.drawFastHLine(LEGEND_W, 118, MID_RIGHT - LEGEND_W, COL_LABEL);
 
-  // button legend, one entry per third of the screen height, D0 top -> D2 bottom
-  static const char    *ID[3]    = {"D0", "D1", "D2"};
+  // button legend, one entry per third of the screen height (D0 top -> D2
+  // bottom), function name only, rotated 270 (reads bottom-to-top)
   static const char    *FUNC[3]  = {"TARE", "CHAN", "POWER"};
   static const uint16_t COLOR[3] = {ST77XX_BLUE, COL_VALUE, COL_BAD};
-  tft.setTextSize(1);
   for (uint8_t i = 0; i < 3; i++) {
     int y0 = i * 45;
-    tft.setTextColor(COLOR[i], COL_BG);
-    tft.setCursor(3, y0 + 16); tft.print(ID[i]);
-    tft.setCursor(3, y0 + 28); tft.print(FUNC[i]);
+    int labelH = strlen(FUNC[i]) * 6;   // rotated label's on-screen height, size 1
+    drawVerticalLabel((LEGEND_W - 8) / 2, y0 + (45 - labelH) / 2, FUNC[i], COLOR[i], 1, false);
     if (i) tft.drawFastHLine(0, y0, LEGEND_W, COL_LABEL);
   }
 
@@ -615,13 +615,9 @@ void setup() {
   tft.setTextSize(1);
   tft.setCursor((240 - 6 * 25) / 2, 92);
   tft.print("Wireless Contact Pressure");
-  delay(1400);
-
-  tftStatic();
-  tft.setTextSize(1);
-  tft.setTextColor(COL_VALUE, COL_BG);
-  tft.setCursor(0, 40);
-  tft.println("booting...");
+  // This splash stays up through sensor init and the WiFi connection attempt
+  // below - the screen only changes once we know whether we're joining the
+  // network or falling back to the setup hotspot.
 
   // buttons: D0 is active LOW, D1/D2 are active HIGH
   pinMode(0, INPUT_PULLUP);
@@ -663,10 +659,24 @@ void setup() {
   WiFi.setHostname(HOSTNAME);
   WiFi.setSleep(false);                 // much lower latency for streaming
   WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+
+  // "Connecting..." + a progress bar on the splash screen, filling over the
+  // same 20s window this loop allows for the join to succeed.
+  const uint32_t WIFI_TIMEOUT_MS = 20000;
+  tft.setTextSize(1);
+  tft.setTextColor(COL_LABEL, COL_BG);
+  tft.setCursor((240 - 6 * 13) / 2, 104);
+  tft.print("Connecting...");
+  int barX = 20, barY = 116, barW = 200, barH = 10;
+  tft.drawRect(barX, barY, barW, barH, COL_LABEL);
+
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
     delay(250);
     Serial.print('.');
+    uint32_t elapsed = millis() - t0;
+    int fillW = constrain((int)((uint64_t)elapsed * (barW - 2) / WIFI_TIMEOUT_MS), 0, barW - 2);
+    tft.fillRect(barX + 1, barY + 1, fillW, barH - 2, COL_ACCENT);
   }
   Serial.println();
 
@@ -674,6 +684,7 @@ void setup() {
     wifiMode = WIFI_MODE_CONNECTED;
     Serial.print("IP: "); Serial.println(WiFi.localIP());
     if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", HTTP_PORT);
+    tftStatic();   // replaces the boot splash with the normal reading screen
   } else {
     wifiMode = WIFI_MODE_PROVISION;
     Serial.println("WiFi join failed - opening setup hotspot");
@@ -829,6 +840,15 @@ void loop() {
     bool s2 = db2.update(digitalRead(2));
     bool rising0 = s0 && !p0, rising1 = s1 && !p1;
     bool falling1 = !s1 && p1, rising2 = s2 && !p2;
+    p0 = s0; p1 = s1; p2 = s2;
+
+    // None of tare / channel-switch / screen-blank / power-off make sense
+    // while the setup hotspot's instructions are on screen, and none of them
+    // should be able to touch the display in that mode - tftProvisionScreen()
+    // is meant to stay up untouched until the board actually reconnects
+    // (which happens via a full reboot from the portal's /save handler, not
+    // from anything in this loop).
+    if (wifiMode != WIFI_MODE_CONNECTED) return;
 
     if (!screenOn) {
       if (rising0 || rising1 || rising2) {
@@ -850,6 +870,5 @@ void loop() {
 
       if (rising2) powerOff();   // never returns; wakes on next D2 press
     }
-    p0 = s0; p1 = s1; p2 = s2;
   }
 }
