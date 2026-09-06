@@ -607,14 +607,12 @@ void setup() {
     tft.setTextSize(sSmall); tft.setCursor(x0 + wA + wT, ySmall);    tft.print("M");
   }
 
-  tft.setTextSize(3);
+  tft.setTextSize(2);
   tft.setTextColor(ST77XX_WHITE, COL_BG);
-  tft.setCursor((240 - 6 * 3 * 6) / 2, 58);
-  tft.print("Hello!");
-
-  tft.setTextSize(1);
-  tft.setCursor((240 - 6 * 25) / 2, 92);
-  tft.print("Wireless Contact Pressure");
+  tft.setCursor((240 - 6 * 2 * 8) / 2, 58);
+  tft.print("Wireless");
+  tft.setCursor((240 - 6 * 2 * 16) / 2, 76);
+  tft.print("Contact Pressure");
   // This splash stays up through sensor init and the WiFi connection attempt
   // below - the screen only changes once we know whether we're joining the
   // network or falling back to the setup hotspot.
@@ -660,14 +658,10 @@ void setup() {
   WiFi.setSleep(false);                 // much lower latency for streaming
   WiFi.begin(savedSsid.c_str(), savedPass.c_str());
 
-  // "Connecting..." + a progress bar on the splash screen, filling over the
-  // same 20s window this loop allows for the join to succeed.
+  // Progress bar on the splash screen, filling over the same 20s window
+  // this loop allows for the join to succeed.
   const uint32_t WIFI_TIMEOUT_MS = 20000;
-  tft.setTextSize(1);
-  tft.setTextColor(COL_LABEL, COL_BG);
-  tft.setCursor((240 - 6 * 13) / 2, 104);
-  tft.print("Connecting...");
-  int barX = 20, barY = 116, barW = 200, barH = 10;
+  int barX = 20, barY = 100, barW = 200, barH = 12;
   tft.drawRect(barX, barY, barW, barH, COL_LABEL);
 
   uint32_t t0 = millis();
@@ -742,7 +736,6 @@ void setup() {
   rawServer.setNoDelay(true);
 
   readBattery();
-  tftStatic();
   rateWindowStart = millis();
 }
 
