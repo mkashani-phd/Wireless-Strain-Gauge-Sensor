@@ -168,6 +168,9 @@ float toUnits(uint8_t ch, int32_t raw) {
 #define COL_WARN    0xFD20
 #define COL_BAD     0xF800
 #define COL_ACCENT  0x05FF            // cyan
+#define COL_PURPLE  0x8010            // purple
+#define COL_LTGREY  0xC618            // lighter/"whiter" grey than COL_LABEL
+#define COL_TAMU    0x5000            // Texas A&M maroon
 
 String pad(const String &s, int n) {
   String r = s;
@@ -186,9 +189,9 @@ static const int MID_RIGHT   = 240 - RIGHT_COL_W;   // right edge of the middle 
 // display rotated 90 clockwise (so it reads top-to-bottom). Simpler and
 // safer than juggling the display's global setRotation() mid-draw, since it
 // can't disturb anything else's orientation if the math here is off.
-void drawVerticalLabel(int x, int y, const char *text, uint16_t color) {
-  GFXcanvas1 canvas(72, 8);
-  canvas.setTextSize(1);
+void drawVerticalLabel(int x, int y, const char *text, uint16_t color, uint8_t size = 1) {
+  GFXcanvas1 canvas(strlen(text) * 6 * size, 8 * size);
+  canvas.setTextSize(size);
   canvas.setTextColor(1);
   canvas.setCursor(0, 0);
   canvas.print(text);
@@ -208,7 +211,7 @@ void tftStatic() {
   tft.drawFastVLine(LEGEND_W, 0, 135, COL_LABEL);
   tft.drawFastVLine(MID_RIGHT, 0, 135, COL_LABEL);
   tft.drawFastHLine(LEGEND_W, 10, MID_RIGHT - LEGEND_W, COL_LABEL);
-  tft.drawFastHLine(LEGEND_W, 90, MID_RIGHT - LEGEND_W, COL_LABEL);
+  tft.drawFastHLine(LEGEND_W, 118, MID_RIGHT - LEGEND_W, COL_LABEL);
 
   // button legend, one entry per third of the screen height, D0 top -> D2 bottom
   static const char    *ID[3]    = {"D0", "D1", "D2"};
@@ -225,19 +228,26 @@ void tftStatic() {
 
   // right column: where the physical hard-reset button is, written
   // vertically (rotated 90) since the column itself is only 34px wide
-  drawVerticalLabel(MID_RIGHT + 13, 32, "HARD REBOOT", COL_WARN);
+  drawVerticalLabel(MID_RIGHT + 9, 1, "HARD REBOOT", COL_WARN, 2);
 }
 
 void tftUpdate() {
   if (!screenOn || wifiMode == WIFI_MODE_PROVISION) return;
   char buf[40];
 
-  // --- top row: IP address, then voltage, then the battery bar
+  // --- top row: IP address ("IP:" in green, the address itself in grey),
+  // then voltage, then the battery bar
   tft.setTextSize(1);
-  tft.setTextColor(COL_ACCENT, COL_BG);
   tft.setCursor(LEGEND_W + 2, 1);
-  if (WiFi.status() == WL_CONNECTED) tft.print(pad("IP: " + WiFi.localIP().toString(), 16));
-  else                               tft.print(pad("connecting...", 16));
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.setTextColor(COL_OK, COL_BG);
+    tft.print("IP: ");
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.print(pad(WiFi.localIP().toString(), 13));
+  } else {
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.print(pad("connecting...", 19));
+  }
 
   // battery: voltage text right next to the bar, both anchored to the
   // right edge of the middle area (not the screen - the reboot column owns that)
@@ -254,18 +264,23 @@ void tftUpdate() {
   tft.print(buf);
 
   // --- one big reading for whichever channel D1 has selected
+  // ("CH-" smaller and grey, the channel number itself bigger and a
+  // lighter/whiter grey - same family, not a different color)
   tft.setTextSize(2);
   tft.setTextColor(COL_LABEL, COL_BG);
   tft.setCursor(LEGEND_W + 2, 14);
-  snprintf(buf, sizeof(buf), "CH%u", dispChan + 1);
-  tft.print(pad(String(buf), 4));
+  tft.print("CH-");
+  tft.setTextSize(3);
+  tft.setTextColor(COL_LTGREY, COL_BG);
+  snprintf(buf, sizeof(buf), "%u", dispChan + 1);
+  tft.print(pad(String(buf), 2));
 
   // Fixed-width field, sized to always fit at this font size (wrap is off,
   // so anything wider would just clip instead of spilling onto the next
   // line and leaving unerased leftovers there).
   tft.setTextSize(4);
   tft.setTextColor(adcOk ? COL_VALUE : COL_BAD, COL_BG);
-  tft.setCursor(LEGEND_W + 2, 34);
+  tft.setCursor(LEGEND_W + 2, 52);
   if (adcOk) {
     float v = lastUnits[dispChan];
     if (fabsf(v) < 1000) snprintf(buf, sizeof(buf), "%6.1f", v);
@@ -277,7 +292,7 @@ void tftUpdate() {
 
   tft.setTextSize(2);
   tft.setTextColor(COL_LABEL, COL_BG);
-  tft.setCursor(LEGEND_W + 2, 70);
+  tft.setCursor(LEGEND_W + 2, 90);
   tft.print(pad(String(unitLabel[dispChan]), 6));
 
   // --- bottom status row: gain, rate, ws clients
@@ -574,11 +589,33 @@ void setup() {
                             // another row and leave unerased leftovers there
 
   tft.fillScreen(COL_BG);
+
+  // "ATM" logo lockup: small-BIG-small, centered at the top. (This is a
+  // sizing effect with the built-in font, not TAMU's actual wordmark font -
+  // embedding that would need a real font file, which isn't practical here.)
+  {
+    uint8_t sSmall = 3, sBig = 5;
+    int wA = 6 * sSmall, wT = 6 * sBig, wM = 6 * sSmall;
+    int hSmall = 8 * sSmall, hBig = 8 * sBig;
+    int total = wA + wT + wM;
+    int x0 = (240 - total) / 2;
+    int yBig = 4, ySmall = yBig + (hBig - hSmall) / 2;
+
+    tft.setTextColor(COL_TAMU, COL_BG);
+    tft.setTextSize(sSmall); tft.setCursor(x0, ySmall);              tft.print("A");
+    tft.setTextSize(sBig);   tft.setCursor(x0 + wA, yBig);           tft.print("T");
+    tft.setTextSize(sSmall); tft.setCursor(x0 + wA + wT, ySmall);    tft.print("M");
+  }
+
   tft.setTextSize(3);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.setCursor(30, 50);
+  tft.setTextColor(ST77XX_WHITE, COL_BG);
+  tft.setCursor((240 - 6 * 3 * 6) / 2, 58);
   tft.print("Hello!");
-  delay(900);
+
+  tft.setTextSize(1);
+  tft.setCursor((240 - 6 * 25) / 2, 92);
+  tft.print("Wireless Contact Pressure");
+  delay(1400);
 
   tftStatic();
   tft.setTextSize(1);
